@@ -1,0 +1,366 @@
+---
+title: "SURV727 Final Project"
+author: "GauriGirirajan"
+date: "2025-12-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+Libraries
+```{r}
+library(httr)
+library(httr2)
+library(dplyr)
+library(jsonlite)
+library(leaflet)
+library(leaflet.extras)
+library(ggplot2)
+library(geosphere)
+library(tidyverse)
+```
+
+
+Set up 
+```{r}
+# API url
+api_url <- "https://acleddata.com/api/acled/read?_format=json&country=Sudan&year=2024"
+# Token authorization url
+token_url <- "https://acleddata.com/oauth/token"
+
+response <- 
+  
+  request(api_url) %>% 
+  
+  req_oauth_password(.,
+                     client = oauth_client("acled", token_url),
+                     username = Sys.getenv("API_USER"),
+                     password = Sys.getenv("API_PASS")
+  ) %>%
+  
+  req_perform()
+
+df <- resp_body_json(response, simplifyVector = TRUE)$data
+```
+
+
+
+Filtering dataset
+```{r}
+actors <- c(
+  "Rapid Support Forces",
+  "Military Forces of Sudan (2019-2023)",
+  "Military Forces of Sudan (2019-)"
+)
+
+Sudan <- df %>%
+  filter(
+    as.Date(event_date) >= as.Date("2024-01-01") &
+      as.Date(event_date) <= as.Date("2024-06-30") &
+      # Keep only events where exactly one actor from the list appears
+      rowSums(across(c(actor1, actor2), ~ .x %in% actors)) == 1
+  )
+
+
+#RSF dataset
+RSF <- Sudan %>%
+  filter(actor1 == "Rapid Support Forces" | actor2 == "Rapid Support Forces") 
+
+#SAF dataset
+SAF<- Sudan %>%
+  filter(actor1 == "Military Forces of Sudan (2019-)" | actor2 == "Military Forces of Sudan (2019-)") 
+```
+
+
+Mineral Facilities
+Download the XLSX file from the Github to your own computer and replace the file path with your own
+```{r}
+library(readxl)
+df1 <- read_excel("C:/Users/GauriPC/Downloads/Africa_GIS Supporting Data/a. Africa_GIS Shapefiles/AFR_Mineral_Facilities.shp/AFR_Mineral_Facilities.xlsx")
+minerals<-df1 %>%
+  filter(Country=="Sudan")
+```
+
+
+Converting latitude and longitude
+```{r}
+Sudan$latitude<-as.numeric(Sudan$latitude)
+Sudan$longitude<-as.numeric(Sudan$longitude)
+
+RSF$latitude<-as.numeric(RSF$latitude)
+RSF$longitude<-as.numeric(RSF$longitude)
+
+SAF$latitude<-as.numeric(SAF$latitude)
+SAF$longitude<-as.numeric(SAF$longitude)
+```
+
+
+Distance from mineral facilities variable
+```{r}
+rsf_coords<-RSF[, c("latitude", "longitude")]
+saf_coords<-SAF[, c("latitude", "longitude")]
+facilities_coords<-minerals[, c("Latitude", "Longitude")]
+RSF$dist_to_mine <- apply(rsf_coords, 1, function(event) {
+  min(distHaversine(event, facilities_coords))  # distance in meters
+})
+
+SAF$dist_to_mine <- apply(saf_coords, 1, function(event) {
+  min(distHaversine(event, facilities_coords))  # distance in meters
+})
+```
+
+
+RSF Clustering
+```{r}
+cluster_rsf <- RSF %>%
+  select(fatalities, dist_to_mine) %>%
+  mutate(across(everything(), scale))
+
+#elbow method
+set.seed(123)
+wss <- map_dbl(1:10, function(k){
+  kmeans(cluster_rsf, centers = k, nstart = 30)$tot.withinss
+})
+
+plot(1:10, wss, type = "b",
+     xlab = "Number of clusters (k)",
+     ylab = "Total within-cluster sum of squares",
+     main="RSF Clusters")
+
+
+#k clustering
+set.seed(123)
+k <- 4
+model <- kmeans(cluster_rsf, centers = k, nstart = 30)
+
+RSF$cluster <- factor(model$cluster)
+
+
+```
+
+
+RSF Visualizations and Cluster Summaries
+```{r}
+#map clusters
+
+#color palette
+pal <- colorFactor(
+  palette = "Set1",
+  domain = RSF$cluster
+)
+
+#map
+RSF_cluster_map<-leaflet(RSF) %>%
+  addTiles() %>%  # base map
+  addCircleMarkers(
+    ~longitude, ~latitude,
+    color = ~pal(cluster),
+    radius = 5,
+    stroke = FALSE,
+    fillOpacity = 0.7,
+    popup = ~paste("Cluster:", cluster,
+                   "<br>Fatalities:", fatalities,
+                   "<br>Distance to Mineral Facility:", round(dist_to_mine,1), "km")
+  ) %>%
+  addLegend(
+    "bottomright",
+    pal = pal,
+    values = ~cluster,
+    title = "Cluster"
+  ) %>%
+  addCircleMarkers(
+    data = minerals,
+    ~Longitude, ~Latitude,
+    color = "black",
+    radius = 6,
+    stroke = TRUE,
+    weight = 1,
+    fillOpacity = 1,
+    popup = ~paste("Mineral Facility")
+  ) %>%
+  addLegend(
+    position = "bottomleft",
+    colors = "black",
+    labels = "Mineral Facility",
+    title = "Mineral Sites"
+  ) %>%
+  addControl(
+    html = "<h3>RSF Event Clusters and Mineral Facilities</h3>",
+    position = "topleft"
+  )
+
+
+#cluster summary
+rsf_summary <- RSF %>%
+  group_by(cluster) %>%
+  summarise(
+    n_events = n(),
+    mean_fatalities = mean(fatalities, na.rm = TRUE),
+    median_fatalities = median(fatalities, na.rm = TRUE),
+    min_fatalities = min(fatalities, na.rm = TRUE),
+    max_fatalities = max(fatalities, na.rm = TRUE),
+    mean_dist_mineral = mean(dist_to_mine, na.rm = TRUE),
+    median_dist_mineral = median(dist_to_mine, na.rm = TRUE),
+    min_dist_mineral = min(dist_to_mine, na.rm = TRUE),
+    max_dist_mineral = max(dist_to_mine, na.rm = TRUE)
+  )
+
+#cluster event summary
+rsf_event_summary <- RSF %>%
+  group_by(cluster, sub_event_type) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(cluster) %>%
+  mutate(prop = n / sum(n))
+
+#box plot
+RSF_boxplot<-ggplot(RSF, aes(x = cluster, y = fatalities)) +
+  geom_boxplot() +
+  labs(title = "RSF Distribution of Fatalities by Cluster")
+
+#scatter plot
+RSF_scatter<-ggplot(RSF, aes(x = dist_to_mine, y = fatalities, color = cluster, size = fatalities)) +
+  geom_point(alpha = 0.7) +
+  labs(title = "RSF Clusters by Fatalities and Distance to Mineral Facilities",
+       x = "Distance to Mineral Facility (km)",
+       y = "Fatalities") +
+  theme_minimal()
+
+#histogram
+RSF_hist<-ggplot(RSF, aes(x = fatalities)) +
+  geom_histogram(binwidth = 1, fill = "steelblue", color = "white") +
+  facet_wrap(~ cluster, scales = "free_y") +
+  labs(title = "RSF Distribution of Fatalities by Cluster",
+       x = "Fatalities",
+       y = "Count of Events") +
+  theme_minimal()
+
+```
+
+
+
+SAF Clustering
+```{r}
+cluster_saf <- SAF %>%
+  select(fatalities, dist_to_mine) %>%
+  mutate(across(everything(), scale))
+
+#elbow method
+set.seed(123)
+wss1 <- map_dbl(1:10, function(k){
+  kmeans(cluster_saf, centers = k, nstart = 30)$tot.withinss
+})
+
+plot(1:10, wss1, type = "b",
+     xlab = "Number of clusters (k)",
+     ylab = "Total within-cluster sum of squares",
+     main="SAF Clusters")
+
+
+#k clustering
+set.seed(123)
+k1 <- 3
+model1 <- kmeans(cluster_saf, centers = k1, nstart = 30)
+
+SAF$cluster <- factor(model1$cluster)
+
+```
+
+
+SAF Visualizations and Cluster Summaries
+```{r}
+#color palette
+pal1 <- colorFactor(
+  palette = "Set1",
+  domain = SAF$cluster
+)
+
+#map
+SAF_cluster_map<-leaflet(SAF) %>%
+  addTiles() %>%  # base map
+  addCircleMarkers(
+    ~longitude, ~latitude,
+    color = ~pal1(cluster),
+    radius = 5,
+    stroke = FALSE,
+    fillOpacity = 0.7,
+    popup = ~paste("Cluster:", cluster,
+                   "<br>Fatalities:", fatalities,
+                   "<br>Distance to Mineral Facility:", round(dist_to_mine,1), "km")
+  ) %>%
+  addLegend(
+    "bottomright",
+    pal = pal,
+    values = ~cluster,
+    title = "Cluster"
+  ) %>%
+  addCircleMarkers(
+    data = minerals,
+    ~Longitude, ~Latitude,
+    color = "black",
+    radius = 6,
+    stroke = TRUE,
+    weight = 1,
+    fillOpacity = 1,
+    popup = ~paste("Mineral Facility")
+  ) %>%
+  addLegend(
+    position = "bottomleft",
+    colors = "black",
+    labels = "Mineral Facility",
+    title = "Mineral Sites"
+  ) %>%
+  addControl(
+    html = "<h3>SAF Event Clusters and Mineral Facilities</h3>",
+    position = "topleft"
+  )
+
+
+#cluster summary
+saf_summary <- SAF %>%
+  group_by(cluster) %>%
+  summarise(
+    n_events = n(),
+    mean_fatalities = mean(fatalities, na.rm = TRUE),
+    median_fatalities = median(fatalities, na.rm = TRUE),
+    min_fatalities = min(fatalities, na.rm = TRUE),
+    max_fatalities = max(fatalities, na.rm = TRUE),
+    mean_dist_mineral = mean(dist_to_mine, na.rm = TRUE),
+    median_dist_mineral = median(dist_to_mine, na.rm = TRUE),
+    min_dist_mineral = min(dist_to_mine, na.rm = TRUE),
+    max_dist_mineral = max(dist_to_mine, na.rm = TRUE)
+  )
+
+#cluster event summary
+saf_event_summary <- SAF %>%
+  group_by(cluster, sub_event_type) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(cluster) %>%
+  mutate(prop = n / sum(n))
+
+#box plot
+SAF_boxplot<-ggplot(SAF, aes(x = cluster, y = fatalities)) +
+  geom_boxplot() +
+  labs(title = "SAF Distribution of Fatalities by Cluster")
+
+#scatter plot
+SAF_scatter<-ggplot(SAF, aes(x = dist_to_mine, y = fatalities, color = cluster, size = fatalities)) +
+  geom_point(alpha = 0.7) +
+  labs(title = "SAF Clusters by Fatalities and Distance to Mineral Facilities",
+       x = "Distance to Mineral Facility (km)",
+       y = "Fatalities") +
+  theme_minimal()
+
+#histogram
+SAF_hist<-ggplot(SAF, aes(x = fatalities)) +
+  geom_histogram(binwidth = 1, fill = "steelblue", color = "white") +
+  facet_wrap(~ cluster, scales = "free_y") +
+  labs(title = "SAF Distribution of Fatalities by Cluster",
+       x = "Fatalities",
+       y = "Count of Events") +
+  theme_minimal()
+
+```
+
